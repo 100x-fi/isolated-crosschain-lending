@@ -1,0 +1,30 @@
+# env
+.env
+
+.DS_Store
+*.swp
+.tmp
+# edtior
+.vscode/*
+
+# build
+build/*
+node_modules/*
+typechain/*
+artifacts/*
+cache/
+out/*
+compiled-typechain/*
+
+# deployments
+deployments/*
+scripts/results/*
+
+# openzeppelin
+.openzeppelin/unknown-31337.json
+.openzeppelin/prod-rehearsal-1-unknown-56.json
+
+# log
+coverage/*
+coverage.json
+yarn-error.log
