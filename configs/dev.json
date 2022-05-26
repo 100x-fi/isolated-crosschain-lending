@@ -1,0 +1,33 @@
+{
+  "bsc": {
+    "cashier": "",
+    "oracle": {
+      "offChain": ""
+    },
+    "marketConfig": "",
+    "markets": {
+      "bsctest-fuji:SimpleToken-SimpleToken": ""
+    },
+    "treasuryHolder": "",
+    "tokens": {
+      "SimpleToken": "",
+      "USD": "" 
+    }
+  },
+  "fuji": {
+    "cashier": "",
+    "oracle": {
+      "offChain": ""
+    },
+    "marketConfig": "",
+    "markets": {
+      "bsctest-fuji:SimpleToken-SimpleToken": ""
+    },
+    "treasuryHolder": "",
+    "tokens": {
+      "SimpleToken": "",
+      "USD": ""
+    }
+  }
+}
+  

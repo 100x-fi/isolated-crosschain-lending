@@ -1,0 +1,223 @@
+
+  /// @notice Sender borrows `_amount` and transfers it to `to`.
+  /// @dev "checkSafe" modifier prevents msg.sender from borrow > collateralFactor
+  /// @param _to The address to received borrowed debt
+  /// @param _borrowAmount The amount of debt to be borrowed
+  /// @param _minPrice The minimum price for collateral
+  /// @param _maxPrice The maximum price for collateral
+  function borrowAndWithdraw(
+    address _to,
+    uint256 _borrowAmount,
+    uint256 _minPrice,
+    uint256 _maxPrice
+  )
+    external
+    nonReentrant
+    accrue
+    updateCollateralPriceWithSlippageCheck(_minPrice, _maxPrice)
+    checkSafe
+    returns (uint256 _debtShare, uint256 _share)
+  {
+    // 1. Borrow debt
+    (_debtShare, _share) = _borrow(msg.sender, _borrowAmount);
+
+    // 2. Withdraw debt from Cashier to "_to"
+    _vaultWithdraw(debt, _to, _borrowAmount, 0);
+  }
+
+
+
+  /// @dev batch prepare liquidate, TODO: review this
+  /// @param _users An array of user addresses.
+  /// @param _maxDebtShares A one-to-one mapping to `users`, contains maximum (partial) borrow amounts (to liquidate) of the respective user.
+  /// @param _to Address of the receiver in open liquidations
+  /// @return _sumCollateralShare result of prepare liquidates
+  /// @return _sumDebtAmount result of prepare liquidates
+  /// @return _sumDebtShare result of prepare liquidates
+  function _prepareLiquidates(
+    address[] calldata _users,
+    uint256[] calldata _maxDebtShares,
+    address _to
+  )
+    internal
+    returns (
+      uint256 _sumCollateralShare,
+      uint256 _sumDebtAmount,
+      uint256 _sumDebtShare
+    )
+  {
+    uint256 _liquidationPenalty = marketConfig.liquidationPenalty(address(this));
+
+    // 1. Force update collateral & debt prices
+    (, uint256 _collateralPrice) = updateCollateralPrice();
+    (, uint256 _debtPrice) = updateDebtPrice();
+
+    // 2. Loop-through all users to check if we are able to liquidate
+    Conversion memory _cashierTotals = cashier.totals(collateral);
+
+    for (uint256 i = 0; i < _users.length; i++) {
+      address _user = _users[i];
+      uint256 _maxUserDebtShare = _maxDebtShares[i];
+      // 2.1. If user position is safe, skip, otherwise can liquidate
+      if (_checkSafe(_user, _collateralPrice, _debtPrice)) continue;
+      // 2.3 prepare liquidate
+      (uint256 _collateralShare, uint256 _borrowAmount, uint256 _lessDebtShare) = _prepareLiquidate(
+        _user,
+        _to,
+        _cashierTotals,
+        _collateralPrice,
+        _maxUserDebtShare,
+        _liquidationPenalty
+      );
+
+      // 2.4 Update total vairables
+      _sumCollateralShare = _sumCollateralShare + _collateralShare;
+      _sumDebtAmount = _sumDebtAmount + _borrowAmount;
+      _sumDebtShare = _sumDebtShare + _lessDebtShare;
+    }
+  }
+
+  /// @dev prepare liquidation statement, need to separate the function to avoid stack-too-deep error
+  function _prepareLiquidate(
+    address _user,
+    address _to,
+    Conversion memory _cashierTotals,
+    uint256 _collateralPrice,
+    uint256 _maxUserDebtShare,
+    uint256 _liquidationPenalty
+  )
+    internal
+    returns (
+      uint256 _collateralShare,
+      uint256 _borrowAmount,
+      uint256 _lessDebtShare
+    )
+  {
+    // 1. repay debt
+    (_collateralShare, _borrowAmount, _lessDebtShare) = _repay(
+      _user,
+      _cashierTotals,
+      _collateralPrice,
+      _maxUserDebtShare,
+      _liquidationPenalty
+    );
+    // 2. callback to treasury contract (for settling bad debts)
+    _treasuryCallback(_user);
+
+    // 3. transfer a collateral share back to _to specified by liquidator
+    _transferCollateralShare(_user, _to, _collateralShare);
+  }
+
+
+  /// @notice Kill user's positions if the _collateralFactor conditon is met.
+  /// @param _users An array of user addresses.
+  /// @param _maxDebtShares A one-to-one mapping to `users`, contains maximum (partial) borrow amounts (to liquidate) of the respective user.
+  /// @param _to Address of the receiver in open liquidations if `swapper` is zero.
+  function kill(
+    address[] calldata _users,
+    uint256[] calldata _maxDebtShares,
+    address _to,
+    IFlashLiquidateStrategy _flashLiquidateStrategy
+  ) public nonReentrant accrue {
+    // 1. Prepare variables
+    uint256 _liquidationPenalty = marketConfig.liquidationPenalty(address(this));
+    uint256 _liquidationTreasuryBps = marketConfig.liquidationTreasuryBps(address(this));
+    require(_liquidationPenalty <= 19000 && _liquidationPenalty >= 10000, "bad liquidation penalty");
+    require(_liquidationTreasuryBps <= 2000 && _liquidationTreasuryBps >= 500, "bad liquidation treasury bps");
+    require(marketConfig.treasury() != address(0), "bad treasury");
+    require(_users.length == _maxDebtShares.length, "invalid a user length comparing to maxDebtShares");
+
+    (uint256 _sumCollateralShare, uint256 _sumDebtAmount, uint256 _sumDebtShare) = _prepareLiquidates(
+      _users,
+      _maxDebtShares,
+      _to
+    );
+
+    // 2. Revert if all users are safe
+    require(_sumDebtAmount != 0, "all healthy");
+
+    // 3. Update market global states
+    totalDebtValue = totalDebtValue - _sumDebtAmount;
+    totalDebtShare = totalDebtShare - _sumDebtShare;
+    totalCollateralShare = totalCollateralShare - _sumCollateralShare;
+
+    // 4. Take out treasury fee on liquidation
+    {
+      uint256 _distributionAmount = ((((_sumDebtAmount * _liquidationPenalty) / BPS_PRECISION) - _sumDebtAmount) *
+        _liquidationTreasuryBps) / BPS_PRECISION;
+      _sumDebtAmount = _sumDebtAmount + _distributionAmount;
+      liquidationFee = liquidationFee + _distributionAmount;
+    }
+
+    // 5. Convert liquidatable amount to share
+    uint256 _allBorrowShare = cashier.toShare(debt, _sumDebtAmount, true);
+
+    // 6. Transfer collateral to liquidator
+    if (address(_flashLiquidateStrategy) != address(0)) {
+      // 6.1. If flash liquidate strategy is set, then call the strategy
+      _flashLiquidateStrategy.execute(collateral, debt, msg.sender, _allBorrowShare, _sumCollateralShare);
+    }
+    // 7. Debit debt from liquidator, if liquidator doesn't has enough debt, then it should revert
+    cashier.transfer(debt, msg.sender, address(this), _allBorrowShare);
+  }
+
+
+  /// @dev repay debt
+  /// CHAIN: debt
+  /// @param _user user address
+  /// @param _cashierTotals collateral share and amount
+  /// @param _collateralPrice current collateral price
+  /// @param _maxUserDebtShare maximum debt share to be repaid
+  /// @param _liquidationPenalty liquidation penalty
+  function _repay(
+    address _user,
+    Conversion memory _cashierTotals,
+    uint256 _collateralPrice,
+    uint256 _maxUserDebtShare,
+    uint256 _liquidationPenalty
+  )
+    internal
+    returns (
+      uint256 _collateralShare,
+      uint256 _borrowAmount,
+      uint256 _lessDebtShare
+    )
+  {
+    uint256 _closeFactorBps = marketConfig.closeFactorBps(address(this));
+    // 1. Findout how much debt share to liquidate
+    _lessDebtShare = MathUpgradeable.min(_maxUserDebtShare, (userDebtShare[_user] * _closeFactorBps) / BPS_PRECISION);
+    // 2. Convert debt share to debt value
+    _borrowAmount = debtShareToValue(_lessDebtShare);
+    // 3. Calculate collateral share to be taken out by liquidator
+    _collateralShare = _cashierTotals.toShare(
+      (_borrowAmount * _liquidationPenalty * COLLATERAL_PRICE_PRECISION) / (BPS_PRECISION * _collateralPrice),
+      false
+    );
+
+    // 4. If the value of leftover collateral less than minDebtSize then liquidator should take all
+    // Need to recalculate _lessDebtShare and _borrowAmount as well.
+    if (
+      _collateralShare > userCollateralShare[_user] ||
+      ((_cashierTotals.toAmount(userCollateralShare[_user] - _collateralShare, false) * _collateralPrice) /
+        COLLATERAL_PRICE_PRECISION) <
+      marketConfig.minDebtSize(address(this))
+    ) {
+      // Take out all collateral
+      _collateralShare = userCollateralShare[_user];
+      userCollateralShare[_user] = 0;
+
+      // Recalculate borrowAmount & lessDebtShare
+      // borrowAmount should be discounted instead of discount on collateral.
+      // Round debtShare up to make sure it is not zero if borrowAmount is tiny.
+      _borrowAmount =
+        (cashier.toAmount(collateral, _collateralShare, false) * _collateralPrice * BPS_PRECISION) /
+        (COLLATERAL_PRICE_PRECISION * _liquidationPenalty);
+      _lessDebtShare = debtValueToShare(_borrowAmount);
+    } else {
+      userCollateralShare[_user] = userCollateralShare[_user] - _collateralShare;
+    }
+
+    // Update userDebtShare
+    userDebtShare[_user] = userDebtShare[_user] - _lessDebtShare;
+    emit LogRepay(msg.sender, _user, _borrowAmount, _lessDebtShare);
+  }
