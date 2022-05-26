@@ -1,7 +1,13 @@
 # Isolated Market Cross-chain Lending
-Isolated cross-chain lending utilizing LayerZero functionalities
+
+⚠️ **Notice**
+- This code is currently not audited and not yet testing properly
+- use or extend it at your own risk!
+
+# Isolated cross-chain lending utilizing LayerZero functionalities
 
 <img width="660" alt="image" src="https://user-images.githubusercontent.com/97577998/170431789-c814f7c8-1148-417e-b802-ed171fdbfcdc.png">
+
 
 **IMPORTANT CONTRACTS**
 - **Market** (Market.sol): 
@@ -18,3 +24,4 @@ Isolated cross-chain lending utilizing LayerZero functionalities
   - simple price oracle to feed price of any available assets to the markets
 - **SimpleToken** (SimpleToken.sol): 
   - a typical ERC20 token 
+
